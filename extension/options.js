@@ -37,14 +37,14 @@ let TODAY = '';
 let editingId = null;
 let busy = false;
 let accMode = 'session';
+let settingsDirty = false;
 
 const MODE_HINT = {
   session: '使用当前浏览器已登录的 GLaDOS 会话，无需填写 Cookie。同一站点只能有一个。',
   cookie: '粘贴该账号的完整 Cookie；可添加多个账号。'
 };
 
-// ---------------------------------------------------------------- 通信
-
+// ---- 通信 ----
 function send(type, payload) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(Object.assign({ type }, payload || {}), (resp) => {
@@ -65,8 +65,7 @@ function send(type, payload) {
   });
 }
 
-// ---------------------------------------------------------------- 工具
-
+// ---- 工具 ----
 function toast(msg, isError) {
   const el = $('toast');
   el.textContent = msg;
@@ -162,6 +161,16 @@ function todayEarned(acc) {
   return null;
 }
 
+function lastMessageOf(last, today) {
+  if (!last) return null;
+  const isToday = last.date === today;
+  return {
+    isToday,
+    message: last.message || '',
+    boost: isToday && last.status === 'success' && last.points > 0 ? last.points : null
+  };
+}
+
 function dotCls(acc) {
   const t = todayStatus(acc);
   if (t.cls === 'success' || t.cls === 'repeat') return 'ok';
@@ -169,8 +178,7 @@ function dotCls(acc) {
   return '';
 }
 
-// ---------------------------------------------------------------- 渲染：账号
-
+// ---- 渲染：账号 ----
 function renderAccounts() {
   const list = $('accountList');
   const accounts = STATE.accounts || [];
@@ -185,13 +193,16 @@ function renderAccounts() {
     const mode = authModeOf(acc);
     const earnedToday = todayEarned(acc);
 
+    const lm = lastMessageOf(last, TODAY);
+    const lastMsg = !lm ? ''
+      : (lm.isToday
+          ? `${escapeHtml(lm.message)}${lm.boost != null ? ` <strong>+${lm.boost}</strong>` : ''}`
+          : `上次 ${escapeHtml(lm.message)}`);
     const lastMain = last
       ? `<div class="acc-last-main">
            <span class="pill ${st.cls === 'idle' ? 'idle' : st.cls}">${escapeHtml(st.label)}</span>
-           <span class="acc-last-msg">${escapeHtml(last.message || '')}${
-             last.status === 'success' && last.points > 0 ? ` <strong>+${last.points}</strong>` : ''
-           }</span>
-           <span class="acc-last-time">${escapeHtml(last.date === TODAY ? st.text : last.date)}</span>
+           <span class="acc-last-msg">${lastMsg}</span>
+           <span class="acc-last-time">${escapeHtml(lm.isToday ? st.text : last.date)}</span>
          </div>`
       : `<div class="acc-last-main">
            <span class="pill idle">未执行</span>
@@ -270,8 +281,7 @@ function renderAccounts() {
     : '无账号';
 }
 
-// ---------------------------------------------------------------- 渲染：站点
-
+// ---- 渲染：站点 ----
 function renderSites() {
   const tbody = $('siteList');
   tbody.innerHTML = (STATE.sites || []).map((s) => `
@@ -289,9 +299,9 @@ function renderSites() {
   `).join('');
 }
 
-// ---------------------------------------------------------------- 渲染：服务器日历
-
+// ---- 渲染：服务器日历 ----
 let calBusy = false;
+let calendarLoaded = false;
 
 function fillCalAccounts() {
   const sel = $('calAccount');
@@ -371,6 +381,7 @@ async function loadCalendar(accountId) {
         </div>
       `;
     }).join('');
+    calendarLoaded = true;
   } catch (e) {
     $('calStatus').hidden = false;
     $('calStatus').className = 'cal-status is-error';
@@ -383,8 +394,7 @@ async function loadCalendar(accountId) {
   }
 }
 
-// ---------------------------------------------------------------- 渲染：调度
-
+// ---- 渲染：调度 ----
 function renderSchedule() {
   const s = STATE.settings || {};
   $('targetHour').value = s.targetHour != null ? s.targetHour : 9;
@@ -393,18 +403,21 @@ function renderSchedule() {
   $('maxStay').value = s.maxStayMs != null ? s.maxStayMs : 6500;
   $('skipIfDone').checked = s.skipIfDone !== false;
   $('notifyEnabled').checked = s.notifyEnabled !== false;
+  $('autoClickTurnstile').checked = s.autoClickTurnstile === true;
+  $('foregroundOnManual').checked = s.foregroundOnManual !== false;
+  $('humanVerify').checked = s.humanVerify !== false;
+  $('keepTabOnVerify').checked = s.keepTabOnVerify !== false;
+  $('updateCheckEnabled').checked = s.updateCheckEnabled !== false;
 }
 
-// ---------------------------------------------------------------- 渲染：推送
-
+// ---- 渲染：推送 ----
 function renderPush() {
   const s = STATE.settings || {};
   $('pushdeerKey').value = s.pushdeerKey || '';
   $('serverchanKey').value = s.serverchanKey || '';
 }
 
-// ---------------------------------------------------------------- 渲染：日志
-
+// ---- 渲染：日志 ----
 function renderLogs() {
   const logs = STATE.logs || [];
   $('logsEmpty').hidden = logs.length > 0;
@@ -433,8 +446,293 @@ function renderLogs() {
   }).join('');
 }
 
-// ---------------------------------------------------------------- 加载/刷新
+// ---- 更新 ----
+const UPDATE_STAMP_KEY = 'gcd_update_checked_at';
+const UPDATE_CACHE_KEY = 'gcd_update_last_result';
+const UPDATE_INTERVAL_MS = 60 * 60 * 1000;   // 1 小时内不重复联网
 
+let pendingRelease = null;
+let updateBusy = false;
+let notesOpen = false;
+
+const curVer = () => chrome.runtime.getManifest().version;
+
+/** 更新区只有一行：状态文字 + 至多一个可点的按钮。 */
+function setUpdateLine(cls, text) {
+  $('updateBar').className = 'update-line' + (cls ? ' ' + cls : '');
+  $('updateState').textContent = text;
+}
+
+function setNotes(text) {
+  const btn = $('btnToggleNotes');
+  const el = $('updateNotes');
+  if (!text) {
+    btn.hidden = true;
+    el.hidden = true;
+    el.textContent = '';
+    notesOpen = false;
+    return;
+  }
+  el.textContent = text;
+  btn.hidden = false;
+  btn.textContent = notesOpen ? '收起说明' : '更新说明';
+  el.hidden = !notesOpen;
+}
+
+/** 只保留一个按钮可见。name 为 null 时全部隐藏。 */
+function showOnly(name) {
+  for (const id of ['btnCheckUpdate', 'btnApplyUpdate', 'btnReloadExt']) {
+    $(id).hidden = id !== name;
+  }
+}
+
+/** 把版本号格式化成「v1.1.1」；非法值返回「v?」。 */
+function vTag(v) {
+  const p = window.Updater && Updater.parseVer(v);
+  return p ? `v${p.join('.')}` : `v${v || '?'}`;
+}
+
+function fmtAgo(ts) {
+  const d = Date.now() - Number(ts || 0);
+  if (!Number.isFinite(d) || d < 0) return '';
+  const m = Math.floor(d / 60000);
+  if (m < 1) return '刚刚';
+  if (m < 60) return `${m} 分钟前`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} 小时前`;
+  return `${Math.floor(h / 24)} 天前`;
+}
+
+/**
+ * 决定更新区显示内容（纯函数，便于单测）。
+ * @returns {{cls:string, text:string, button:string|null, stale:boolean}} stale=需要联网
+ */
+function decideUpdateView(input) {
+  const cur = String(input.current || '');
+  const last = input.lastResult || null;
+  const checkedAt = Number(input.checkedAt || 0);
+  const interval = Number(input.intervalMs || UPDATE_INTERVAL_MS);
+
+  // 1) 有上次结果且确实有新版本 → 直接给出「更新」按钮，不需要联网
+  if (last && last.latest && Updater.compareVer(last.latest, cur) > 0) {
+    const ago = fmtAgo(checkedAt);
+    return {
+      cls: 'is-new',
+      text: `${vTag(cur)} → ${vTag(last.latest)}  有新版本` + (ago ? `（${ago}检查）` : ''),
+      button: 'btnApplyUpdate',
+      stale: false
+    };
+  }
+
+  // 2) 距上次检查还在节流窗口内 → 显示上次结论，不联网
+  if (checkedAt && Date.now() - checkedAt < interval) {
+    return {
+      cls: '',
+      text: `${vTag(cur)} · 已是最新（${fmtAgo(checkedAt)}检查）`,
+      button: 'btnCheckUpdate',
+      stale: false
+    };
+  }
+
+  // 3) 需要联网检查
+  return {
+    cls: '',
+    text: `${vTag(cur)} · 正在检查…`,
+    button: null,
+    stale: true
+  };
+}
+
+/**
+ * 检查更新。
+ * @param {boolean} manual true 时忽略节流，失败时弹 toast
+ */
+async function checkUpdate(manual) {
+  if (updateBusy) return;
+  if (!window.Updater) {
+    setUpdateLine('is-error', '更新模块未加载，请重新加载扩展');
+    showOnly('btnCheckUpdate');
+    if (manual) toast('更新模块未加载，请重新加载扩展', true);
+    return;
+  }
+
+  updateBusy = true;
+  const btn = $('btnCheckUpdate');
+  btn.disabled = true;
+  // 自动检查也要显示进行中，否则界面看起来毫无反应
+  setUpdateLine('', `${vTag(curVer())} · 正在检查…`);
+  showOnly(null);
+
+  try {
+    const r = await Updater.check();
+
+    if (r.error) {
+      setUpdateLine('is-error', `检查失败：${r.error}`);
+      showOnly('btnCheckUpdate');
+      setNotes('');
+      if (manual) toast('检查更新失败：' + r.error, true);
+      return;
+    }
+
+    const now = Date.now();
+    await chrome.storage.local.set({
+      [UPDATE_STAMP_KEY]: now,
+      [UPDATE_CACHE_KEY]: {
+        current: r.current,
+        latest: r.latest,
+        hasUpdate: r.hasUpdate,
+        notes: (r.release && r.release.notes) || '',
+        at: now
+      }
+    });
+
+    if (r.hasUpdate) {
+      pendingRelease = r.release;
+      setUpdateLine('is-new', `${vTag(r.current)} → ${vTag(r.latest)}  有新版本`);
+      showOnly('btnApplyUpdate');
+      $('btnApplyUpdate').textContent = `更新到 ${vTag(r.latest)}`;
+      setNotes(r.release.notes || '（该版本没有更新说明）');
+      if (manual) toast(`发现新版本 ${vTag(r.latest)}`);
+    } else {
+      pendingRelease = null;
+      setUpdateLine('', `${vTag(r.current)} · 已是最新（刚刚检查）`);
+      showOnly('btnCheckUpdate');
+      setNotes('');
+      if (manual) toast('已是最新版本');
+    }
+  } catch (e) {
+    setUpdateLine('is-error', `检查失败：${e.message}`);
+    showOnly('btnCheckUpdate');
+    if (manual) toast('检查更新失败：' + e.message, true);
+  } finally {
+    updateBusy = false;
+    btn.disabled = false;
+  }
+}
+
+async function applyUpdate() {
+  if (updateBusy) return;
+  if (!window.Updater) { toast('更新模块未加载', true); return; }
+  if (busy) { toast('正在签到，请等签到结束后再更新', true); return; }
+
+  updateBusy = true;
+  const btn = $('btnApplyUpdate');
+  btn.disabled = true;
+
+  let rel = pendingRelease;
+  let verTag = rel ? vTag(rel.version) : '';
+  try {
+    // 优先用缓存的版本信息
+    if (!rel) {
+      const cached = await readUpdateCache();
+      const latest = cached && cached.latest;
+      if (!latest || Updater.compareVer(latest, curVer()) <= 0) {
+        toast('没有可更新的版本，请先检查更新', true);
+        return;
+      }
+      try {
+        const fresh = await Updater.fetchLatest();
+        if (Updater.compareVer(fresh.version, curVer()) <= 0) {
+          toast('已是最新版本', true);
+          return;
+        }
+        rel = fresh;
+        verTag = vTag(rel.version);
+      } catch (e) {
+        toast('获取更新包失败：' + e.message, true);
+        return;
+      }
+    }
+
+    const sure = confirm(
+      `更新到 ${verTag}？\n\n` +
+      '· 只覆盖安装包内的文件，不删除目录里的其他文件\n' +
+      '· 旧文件会备份到 backups/\n' +
+      '· 首次需要你指定一次扩展所在目录，之后会记住'
+    );
+    if (!sure) return;
+
+    const r = await Updater.apply(rel, {
+      backup: true,
+      onProgress: (t) => setUpdateLine('is-new', t)
+    });
+    setUpdateLine('is-new', `已更新到 ${vTag(r.version)} · 需重新加载生效`);
+    showOnly('btnReloadExt');
+    setNotes('');
+    pendingRelease = null;
+    toast('更新完成，点「重新加载」生效');
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      setUpdateLine('is-new', `${vTag(curVer())} → ${verTag}  已取消，可重试`);
+      showOnly('btnApplyUpdate');
+      return;
+    }
+    const m = String(e && e.message || e);
+    setUpdateLine('is-error', `更新失败：${m}`);
+    showOnly('btnCheckUpdate');
+    toast('更新失败：' + m, true);
+  } finally {
+    updateBusy = false;
+    btn.disabled = false;
+  }
+}
+
+async function readUpdateCache() {
+  try {
+    const raw = await chrome.storage.local.get([UPDATE_STAMP_KEY, UPDATE_CACHE_KEY]);
+    return Object.assign({ at: Number(raw[UPDATE_STAMP_KEY]) || 0 }, raw[UPDATE_CACHE_KEY] || {});
+  } catch (e) {
+    return null;
+  }
+}
+
+/** 先用缓存渲染，过期再联网检查。 */
+async function initUpdateBar() {
+  if (!window.Updater) {
+    setUpdateLine('is-error', '更新模块未加载，请重新加载扩展');
+    showOnly('btnCheckUpdate');
+    return;
+  }
+
+  const s = STATE.settings || {};
+  const enabled = s.updateCheckEnabled !== false;
+  const cached = await readUpdateCache();
+
+  const view = decideUpdateView({
+    current: curVer(),
+    lastResult: cached,
+    checkedAt: cached ? cached.at : 0,
+    intervalMs: UPDATE_INTERVAL_MS
+  });
+
+  // 先渲染缓存结论：有新版本时断网也能看到「更新」按钮
+  if (view.cls === 'is-new' || (cached && cached.latest)) {
+    setUpdateLine(view.cls, view.text);
+    showOnly(view.button);
+    if (view.cls === 'is-new') {
+      pendingRelease = null;   // 让 applyUpdate 走 fetchLatest 或缓存
+      $('btnApplyUpdate').textContent = `更新到 ${vTag(cached.latest)}`;
+      setNotes(cached.notes || '（该版本没有更新说明）');
+    }
+  } else {
+    setUpdateLine('', `${vTag(curVer())} · 尚未检查`);
+    showOnly('btnCheckUpdate');
+  }
+
+  if (!enabled) {
+    if (!view.cls) {
+      setUpdateLine('', `${vTag(curVer())} · 已关闭自动检查`);
+      showOnly('btnCheckUpdate');
+    }
+    return;
+  }
+
+  // 进入联网态
+  if (view.stale) {
+    await checkUpdate(false);
+  }
+}
+// ---- 加载/刷新 ----
 async function reload() {
   const resp = await send('getState');
   STATE = resp.state;
@@ -455,14 +753,15 @@ async function reload() {
 
   renderAccounts();
   renderSites();
-  renderSchedule();
-  renderPush();
+  if (!settingsDirty) {
+    renderSchedule();
+    renderPush();
+  }
   renderLogs();
   fillCalAccounts();
 }
 
-// ---------------------------------------------------------------- 账号弹窗
-
+// ---- 账号弹窗 ----
 /** 切换弹窗内的认证方式 UI */
 function applyModeUI() {
   document.querySelectorAll('#accMode .seg-btn').forEach((b) => {
@@ -490,7 +789,9 @@ function openModal(accountId) {
 
   const sel = $('accSite');
   sel.innerHTML = (STATE.sites || [])
-    .map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.domain)}</option>`)
+    .map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.domain)}${
+      s.enabled === false ? '（已停用，不会自动签到）' : ''
+    }</option>`)
     .join('');
   if (acc && acc.siteId) sel.value = acc.siteId;
 
@@ -515,6 +816,14 @@ async function saveAccount() {
   const enabled = $('accEnabled').checked;
 
   if (!siteId) { toast('请先选择一个站点', true); return; }
+
+  // 站点停用时账号不会被调度，保存前提示
+  const chosenSite = (STATE.sites || []).find((s) => s.id === siteId);
+  if (chosenSite && chosenSite.enabled === false) {
+    if (!confirm(`站点「${chosenSite.domain}」当前处于停用状态，保存后该账号不会被自动签到。仍要保存吗？`)) {
+      return;
+    }
+  }
 
   if (accMode === 'cookie') {
     if (!cookie) { toast('Cookie 模式必须填写 Cookie', true); return; }
@@ -562,8 +871,7 @@ async function saveAccount() {
   toast('已保存');
 }
 
-// ---------------------------------------------------------------- 登录态探测
-
+// ---- 登录态探测 ----
 async function probeLogin() {
   const btn = $('btnProbeLogin');
   const old = btn.textContent;
@@ -615,7 +923,9 @@ async function probeLogin() {
     }
 
     lines.push('');
-    lines.push('该检测只验证浏览器登录态，不测试签到或 Turnstile。');
+    lines.push('该检测只验证「浏览器自己的登录态」，不读 Cookie、不测试签到或 Turnstile。');
+    lines.push('因此 COOKIE 模式的账号可能在此显示未登录 —— 那是正常的，');
+    lines.push('用账号卡上的「立即签到」才能验证 Cookie 是否有效。');
 
     showDiag(lines.join('\n'), '登录态检测');
   } finally {
@@ -624,8 +934,7 @@ async function probeLogin() {
   }
 }
 
-// ---------------------------------------------------------------- 读取当前登录
-
+// ---- 读取当前登录 ----
 /** 所有可能存放登录态的域名（含别名），用于兜底扫描 */
 const COOKIE_SCAN_DOMAINS = [
   'glados.cloud', 'glados.network', 'glados.rocks',
@@ -633,11 +942,7 @@ const COOKIE_SCAN_DOMAINS = [
   'railgun.info', 'glados-facility.com'
 ];
 
-/**
- * 用多种方式读取某个域名的 cookie，合并去重。
- * 优先用 url 过滤（等价于“该站点会发送的 cookie”，最准确），
- * 再用 domain 过滤兜底 —— 两者在不同 Chrome 版本上行为有差异。
- */
+/** 多方式读取某域名的 cookie 并去重（不同 Chrome 版本行为有差异）。 */
 async function collectCookies(domain) {
   const seen = new Map(); // `${host}|${name}` -> cookie
 
@@ -691,9 +996,7 @@ function buildCookieHeader(cookies) {
   return { header, found, missing, byName };
 }
 
-/**
- * 诊断：把所有 glados 家族的 cookie 全部列出来，便于定位登录在哪。
- */
+/** 列出所有相关域名的 cookie，用于定位登录状态。 */
 async function diagnoseCookies() {
   const lines = [];
   lines.push('浏览器: ' + navigator.userAgent.slice(0, 80));
@@ -837,8 +1140,7 @@ function readCurrentUa() {
   toast('已填入当前浏览器 User-Agent');
 }
 
-// ---------------------------------------------------------------- 执行签到
-
+// ---- 执行签到 ----
 async function runOne(accountId, btnEl) {
   if (busy) return;
   busy = true;
@@ -889,8 +1191,7 @@ async function runAll(btnEl) {
   }
 }
 
-// ---------------------------------------------------------------- 事件绑定
-
+// ---- 事件绑定 ----
 function bindEvents() {
   // 导航
   $('nav').addEventListener('click', (e) => {
@@ -903,18 +1204,37 @@ function bindEvents() {
     if (panel) panel.classList.add('is-active');
 
     // 首次进入日历页自动读一次
-    if (btn.dataset.tab === 'calendar' && !$('calGrid').childElementCount) {
+    if (btn.dataset.tab === 'calendar' && !calendarLoaded) {
       loadCalendar().catch((err) => toast(err.message, true));
     }
   });
 
   // 服务器日历
   $('btnCalRefresh').addEventListener('click', () => {
+    calendarLoaded = false;
     loadCalendar().catch((err) => toast(err.message, true));
   });
   $('calAccount').addEventListener('change', () => {
+    calendarLoaded = false;
     $('calGrid').innerHTML = '';
     loadCalendar().catch((err) => toast(err.message, true));
+  });
+
+  // 更新
+  $('btnCheckUpdate').addEventListener('click', () => {
+    checkUpdate(true).catch((e) => toast(e.message, true));
+  });
+  $('btnApplyUpdate').addEventListener('click', () => {
+    applyUpdate().catch((e) => toast(e.message, true));
+  });
+  $('btnReloadExt').addEventListener('click', () => {
+    // 文件已替换到磁盘，重载即可加载新代码；设置页会随之关闭
+    chrome.runtime.reload();
+  });
+  $('btnToggleNotes').addEventListener('click', () => {
+    notesOpen = !notesOpen;
+    $('btnToggleNotes').textContent = notesOpen ? '收起说明' : '更新说明';
+    $('updateNotes').hidden = !notesOpen;
   });
 
   // 账号
@@ -990,21 +1310,38 @@ function bindEvents() {
     send('saveState', { patch: { sites } }).then(reload);
   });
 
+  const markDirty = () => { settingsDirty = true; };
+  $('panel-settings').addEventListener('input', markDirty);
+  $('panel-settings').addEventListener('change', markDirty);
+
   // 调度
+  $('autoClickTurnstile').addEventListener('change', (e) => {
+    if (!e.target.checked) return;
+    if (!confirm('自动点击 Cloudflare 验证框会使用 Chrome 调试接口，可能短暂显示“正在调试此浏览器”。图片验证仍需手动完成。是否继续？')) {
+      e.target.checked = false;
+    }
+  });
+
   $('btnSaveSchedule').addEventListener('click', async () => {
     const settings = {
       targetHour: Math.max(0, Math.min(23, parseInt($('targetHour').value, 10) || 0)),
       maxDelayMinutes: Math.max(1, Math.min(59, parseInt($('maxDelay').value, 10) || 45)),
-      minStayMs: Math.max(2500, parseInt($('minStay').value, 10) || 4500),
-      maxStayMs: Math.max(2500, parseInt($('maxStay').value, 10) || 6500),
+      minStayMs: Math.min(30000, Math.max(2500, parseInt($('minStay').value, 10) || 4500)),
+      maxStayMs: Math.min(30000, Math.max(2500, parseInt($('maxStay').value, 10) || 6500)),
       skipIfDone: $('skipIfDone').checked,
-      notifyEnabled: $('notifyEnabled').checked
+      notifyEnabled: $('notifyEnabled').checked,
+      autoClickTurnstile: $('autoClickTurnstile').checked,
+      foregroundOnManual: $('foregroundOnManual').checked,
+      humanVerify: $('humanVerify').checked,
+      keepTabOnVerify: $('keepTabOnVerify').checked,
+      updateCheckEnabled: $('updateCheckEnabled').checked
     };
     if (settings.maxStayMs < settings.minStayMs) {
       toast('停留上限不能小于下限', true);
       return;
     }
     await send('saveState', { patch: { settings } });
+    settingsDirty = false;
     await reload();
     toast('设置已保存；旧随机计划已取消，将在下次巡检重新安排');
   });
@@ -1025,6 +1362,7 @@ function bindEvents() {
       serverchanKey: $('serverchanKey').value.trim()
     });
     await send('saveState', { patch: { settings } });
+    settingsDirty = false;
     await reload();
     toast('推送配置已保存');
   });
@@ -1056,25 +1394,42 @@ function bindEvents() {
 
   // 快捷键
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !$('modalMask').hidden) closeModal();
+    if (e.key !== 'Escape') return;
+    if (!$('modalMask').hidden) closeModal();
+    document.querySelectorAll('.modal-mask:not(#modalMask):not([hidden])').forEach((m) => m.remove());
   });
 }
 
-// ---------------------------------------------------------------- 启动
-
+// ---- 启动 ----
 (async function init() {
+  // 更新条先渲染，避免 reload 失败时空白
+  try {
+    setUpdateLine('', `v${curVer()} · 尚未检查`);
+    showOnly('btnCheckUpdate');
+  } catch (e) { /* 元素缺失时忽略 */ }
+
   try {
     bindEvents();
     await reload();
-    chrome.storage.onChanged.addListener((changes, area) => {
-      if (area !== 'local') return;
-      if (!changes.logs && !changes.accounts) return;
-      // 手动签到期间不自动刷新，避免按钮状态被重置
-      if (busy) return;
-      reload().catch(() => {});
-    });
   } catch (e) {
     console.error(e);
     toast('初始化失败：' + e.message, true);
   }
+
+  // 更新检查失败不影响设置页其它功能
+  initUpdateBar().catch((e) => {
+    console.warn('[update]', e);
+    try {
+      setUpdateLine('is-error', `检查失败：${e.message}`);
+      showOnly('btnCheckUpdate');
+    } catch (err) { /* ignore */ }
+  });
+
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local') return;
+    if (!changes.logs && !changes.accounts) return;
+    // 手动签到期间不自动刷新，避免按钮状态被重置
+    if (busy) return;
+    reload().catch(() => {});
+  });
 })();

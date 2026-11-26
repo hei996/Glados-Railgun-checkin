@@ -4,7 +4,7 @@
 
 <p><sub>每天自动完成签到，结果可推送到手机。</sub></p>
 
-支持 **多账号** · **8 个域名** · **Cloudflare Turnstile**：可用 GitHub Actions 无人值守，也可用浏览器扩展在本机真实浏览器中签到。
+支持 **多账号** · **8 个域名** · **Cloudflare Turnstile**：可用 GitHub Actions 无人值守，也可用浏览器扩展在本机真实浏览器中签到（扩展支持内置更新）。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -74,14 +74,21 @@ Actions 版是纯 HTTP 请求，**无法通过 Cloudflare Turnstile**。如果�
 
 ### 版本
 
-当前版本：`1.0.1`。
+当前版本：`1.1.7`。
 
 - `extension/` 目录始终是**最新源码**，适合开发者和本地加载；
-- 发布包按版本号命名，例如 `glados-checkin-extension-v1.0.1.zip`；
-- 升级时替换 `extension/` 目录内容，到 `edge://extensions` 点「重新加载」即可，账号数据保留；
+- 发布包按版本号命名，例如 `glados-checkin-extension-v1.1.7.zip`；
+- 加载目录不变时扩展 ID 不变，账号数据保留；
 - 不要把 `latest` 当成唯一文件名；以 GitHub Releases 的 **Latest** 为准，版本化包便于回退和排查。
 
 Python / Actions 和扩展可以同时保留：Actions 负责无人值守，扩展负责 Cloudflare 限制下的本机补签。
+
+升级方式二选一：
+
+- **扩展内更新**（1.1.0 起）：设置页顶部点「检查更新」→「更新到 vX」→ 首次授权一次扩展所在目录 →「重新加载」。之后每次更新只需两次点击。
+- **手动更新**：下载 zip 解压覆盖 `extension/`，到 `edge://extensions` 点「重新加载」。
+
+Chrome 不允许扩展写入自己的安装目录，所以首次更新需要你手动指定一次目录（句柄会被记住）。详见 [`extension/README.md`](extension/README.md)。
 
 ## 🔧配置 GLADOS_COOKIES
 
@@ -348,6 +355,13 @@ Windows PowerShell 用 `$env:GLADOS_COOKIES='[...]'`。
 ├── README.md                     # 说明文档
 ├── LICENSE                       # MIT 许可
 ├── extension/                    # 浏览器扩展：Cloudflare 备用签到方案
+│   ├── manifest.json             # MV3 清单
+│   ├── background.js             # Service Worker：调度 / 签到 / DNR / 推送
+│   ├── inject.js                 # 页面主世界：保持可见 + 旁听签到响应
+│   ├── updater.js                # 内置更新：版本检查 / zip 解压 / 写盘
+│   ├── popup.*                   # 工具栏弹窗
+│   ├── options.*                 # 设置页
+│   └── test-*.js                 # Node 测试（不打包进发布包）
 └── .github/workflows/
     └── gladosCheck.yml           # Actions 定时任务
 ```
@@ -374,6 +388,91 @@ Windows PowerShell 用 `$env:GLADOS_COOKIES='[...]'`。
 - 推送兼容 Server酱。
 
 **2026-11**
+
+**1.1.7**
+
+- 修复 v1.1.6 引入的在线更新回归：写入预检把真实浏览器对已存在文件的 `TypeMismatchError` 误当成异常抛出，导致更新报 `The path supplied exists, but was not an entry of requested type.`；测试 mock 同步模拟真实 API 的类型错误行为。
+
+**1.1.6**
+
+- 全面代码审查修复（30 项）：更新器增加解压体积上限、4 段版本号、更稳的目录剥离与写入预检；修复双击更新竞态、并发写账号覆盖签到结果、SW 保活与会话状态丢失、订阅表单被后台刷新清空等；
+- 修复 Server酱 URL 拼接、停留时间上限、更新检查文案与实测不一致等问题。
+
+**1.1.5**
+
+- 修复在线更新后扩展无法加载：旧文件备份目录原为 `_backup/`，而 Chrome/Edge 保留所有以 `_` 开头的文件名，导致加载报错。改为 `backups/`；
+- 若本地已存在 `_backup/` 目录，需手动删除后重新加载扩展。
+
+**1.1.4**
+
+- 与 v1.1.3 功能相同，仅作为在线更新修复的验证版本发布，方便确认下载流程已恢复正常；
+- 测试文件中的 mock 版本号同步至当前版本。
+
+**1.1.3**
+
+- 修复在线更新失败（`Failed to fetch`）：Release 下载链接会重定向到 `release-assets.githubusercontent.com`，原权限清单只授权了旧的 `objects.githubusercontent.com`。改为通配符授权 `*.githubusercontent.com`，覆盖所有 GitHub 下载 CDN；
+- 安装包下载加 60 秒超时与更明确的错误提示，避免网络挂起时一直卡在「正在下载安装包…」。
+
+**1.1.2**
+
+- 修复跨零点后昨日签到回执（如 `Checkin! Got 14 Points`）被误显示为今日所得：历史回执加「上次」前缀、不再高亮积分；
+- 「今日是否已签」改用服务端日期判断，本地日期仅兜底；状态请求禁用缓存，避免跨零点读到昨日响应而误判；
+- 修复并发写日志丢条、保存账号时旧快照覆盖签到结果、签到中重置会话签错账号；
+- Cookie 注入规则限定到账号所属站点域，不再带到第三方请求；
+- 推送失败同时写入日志页；新增 `test-state.js`、`test-today.js`。
+
+**1.1.1**
+
+- 设置页更新区简化为单行，任何时刻最多一个按钮；更新说明折叠；
+- 修复 `hidden` 属性被 `.btn` 的 `display` 覆盖、导致多个按钮同时显示的问题（弹窗同源修复）；
+- 修复自动检查更新无视觉反馈、无超时导致"看起来没反应"：改为显式状态机，请求 15 秒超时，节流 1 小时；
+- 去掉「选目录」常驻按钮与「更新前备份」开关（目录按需弹出、备份始终开启）；
+- 移除 `logRetention` 死字段。
+
+**1.1.0**
+
+- 扩展新增**内置更新**：设置页检查 GitHub Release，授权一次目录后就地写入新版本，随后重新加载生效；
+- 下载 zip 在内存解压（无第三方库），校验包内版本与 Release 一致、比当前新，拒绝目录穿越与 ZIP64，旧文件备份到 `_backup/`；
+- 最低 Chrome / Edge 版本提高到 103（需要 `DecompressionStream('deflate-raw')` 与目录选择 API）；
+- 新增 GitHub 相关 `host_permissions`。
+
+**1.0.7**
+
+- 代码审计修复多处缺陷：
+  - 保留标签页提前移除 DNR 规则 → Cookie 模式退化成浏览器登录态，可能签错账号；
+  - DNR 规则 id 撞号 → 误删其他标签页的注入规则；
+  - 关闭「今日已签则跳过」后自动任务每 15 分钟重复签到；
+  - 批量签到把所有账号的页面逐一切到前台；
+  - 兑换请求体格式与 Python 版不一致；
+  - 签到按钮长时间禁用时白等 100 秒；
+- 账号绑定到已停用站点时保存前提示；
+- 新增 DNR 规则与 UI 静态测试。
+
+**1.0.6**
+
+- 人机验证相关动作（自动点击、切前台、人工验证）写入日志 `detail`，前缀 `⚙`；静默通过不记录，避免日常噪音。
+
+**1.0.5**
+
+- 推送换行修正：PushDeer 改用 `type=text`、Server酱用行尾两空格硬换行，与 Python 推送逐字一致；
+- 重复状态文案对齐 Python（「重复签到」），单账号不再显示账号名。
+
+**1.0.4**
+
+- 服务端返回 `code=5`（Cloudflare 拦截）后，把签到页切到前台等待人工验证，拿到令牌后自动重试一次；
+- 验证未完成时保留标签页，便于接着操作。
+
+**1.0.3**
+
+- 修复 Turnstile 在点击签到后才出现时扩展一直停留在后台的问题；
+- 点击期间并行监控验证框，发现后自动激活签到页并提示人工完成；
+- 即使 iframe 初始不可见也会进入等待验证流程。
+
+**1.0.2**
+
+- 扩展增加可选的 Cloudflare 验证框自动点击（默认关闭，需要 `debugger` 权限）；
+- 通过 CDP 在 iframe 内查询 checkbox 坐标，失败时回退到置顶页面人工验证；
+- 补充 `debugger` 权限说明。
 
 **1.0.1**
 
